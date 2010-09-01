@@ -38,6 +38,7 @@
 
 -record(state, {sock,      % protocol buffers socket
                 client,    % local client
+                ref,       % current request's ref
                 req,       % current request (for multi-message requests like list keys)
                 req_ctx}). % context to go along with request (partial results, request ids etc)
 
@@ -69,8 +70,8 @@ handle_info({tcp_closed, Socket}, State=#state{sock=Socket}) ->
     {stop, normal, State};
 handle_info({tcp, _Sock, Data}, State=#state{sock=Socket}) ->
     [MsgCode|MsgData] = Data,
-    Msg = riakc_pb:decode(MsgCode, MsgData),
-    case process_message(Msg, State) of
+    {Ref, Msg} = riakc_pb:decode(MsgCode, MsgData),
+    case process_message(Msg, State#state{ref = Ref}) of
         {pause, NewState} ->
             ok;
         NewState ->
@@ -281,7 +282,7 @@ process_message(#rpbmapredreq{request=MrReq, content_type=ContentType}=Req,
 %% Send a message to the client
 -spec send_msg(msg(), #state{}) -> #state{}.
 send_msg(Msg, State) ->
-    Pkt = riakc_pb:encode(Msg),
+    Pkt = riakc_pb:encode(Msg, State#state.ref),
     gen_tcp:send(State#state.sock, Pkt),
     State.
     
