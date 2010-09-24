@@ -39,8 +39,7 @@
 -record(state, {sock,      % protocol buffers socket
                 client,    % local client
                 ref,       % current request's ref
-                req,       % current request (for multi-message requests like list keys)
-                req_ctx}). % context to go along with request (partial results, request ids etc)
+                req}).     % current request (for multi-message requests like list keys)
 
 
 -define(PROTO_MAJOR, 1).
@@ -71,57 +70,9 @@ handle_info({tcp_closed, Socket}, State=#state{sock=Socket}) ->
 handle_info({tcp, _Sock, Data}, State=#state{sock=Socket}) ->
     [MsgCode|MsgData] = Data,
     {Ref, Msg} = riakc_pb:decode(MsgCode, MsgData),
-    case process_message(Msg, State#state{ref = Ref}) of
-        {pause, NewState} ->
-            ok;
-        NewState ->
-            inet:setopts(Socket, [{active, once}])
-    end,
-    {noreply, NewState};
-
-%% Handle responses from stream_list_keys 
-handle_info({ReqId, done},
-            State=#state{sock = Socket, req=#rpblistkeysreq{}, req_ctx=ReqId}) ->
-    NewState = send_msg(#rpblistkeysresp{done = 1}, State),
+    process_message(Msg, State#state{ref = Ref}),
     inet:setopts(Socket, [{active, once}]),
-    {noreply, NewState#state{req = undefined, req_ctx = undefined}};
-handle_info({ReqId, {keys, []}}, State=#state{req=#rpblistkeysreq{}, req_ctx=ReqId}) ->
-    {noreply, State}; % No keys - no need to send a message, will send done soon.
-handle_info({ReqId, {keys, Keys}}, State=#state{req=#rpblistkeysreq{}, req_ctx=ReqId}) ->
-    {noreply, send_msg(#rpblistkeysresp{keys = Keys}, State)};
-
-%% Handle response from mapred_stream/mapred_bucket_stream
-handle_info({flow_results, ReqId, done},
-            State=#state{sock = Socket, req=#rpbmapredreq{}, req_ctx=ReqId}) ->
-    NewState = send_msg(#rpbmapredresp{done = 1}, State),
-    inet:setopts(Socket, [{active, once}]),
-    {noreply, NewState#state{req = undefined, req_ctx = undefined}};
-
-handle_info({flow_results, ReqId, {error, Reason}},
-            State=#state{sock = Socket, req=#rpbmapredreq{}, req_ctx=ReqId}) ->
-    NewState = send_error("~p", [Reason], State),
-    inet:setopts(Socket, [{active, once}]),
-    {noreply, NewState#state{req = undefined, req_ctx = undefined}};
-
-handle_info({flow_results, PhaseId, ReqId, Res},
-            State=#state{sock=Socket,
-                         req=#rpbmapredreq{content_type = ContentType}, 
-                         req_ctx=ReqId}) ->
-    case encode_mapred_phase(Res, ContentType) of
-        {error, Reason} ->
-            NewState = send_error("~p", [Reason], State),
-            inet:setopts(Socket, [{active, once}]),
-            {noreply, NewState#state{req = undefined, req_ctx = undefined}};
-        Response ->
-            {noreply, send_msg(#rpbmapredresp{phase=PhaseId, 
-                                              response=Response}, State)}
-    end;
-
-handle_info({flow_error, ReqId, Error},
-            State=#state{sock = Socket, req=#rpbmapredreq{}, req_ctx=ReqId}) ->
-    NewState = send_error("~p", [Error], State),
-    inet:setopts(Socket, [{active, once}]),
-    {noreply, NewState#state{req = undefined, req_ctx = undefined}};
+    {noreply, State};
 
 handle_info(_, State) -> % Ignore any late replies from gen_servers/messages from fsms
     {noreply, State}.
@@ -136,13 +87,10 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 %% Message Handling
 %% ===================================================================
 
-%% Process an incoming protocol buffers message.  Return either
-%% a new #state{} if new incoming messages should be received
-%% or {pause, #state{}} if the incoming TCP socket should not be
-%% set active again.
-%%
-%% If 'pause' is returned, it needs to be re-enabled by whatever
-%% callbacks are waiting for it.
+%% Process an incoming protocol buffers message.
+%% Quick transactions are processed within the main process.
+%% Longer transactions, basically anything that goes to the store
+%% are processed via a spawned worker.
 %%
 -spec process_message(msg(), #state{}) ->  #state{} | {pause, #state{}}.
 process_message(rpbpingreq, State) ->
@@ -161,7 +109,13 @@ process_message(rpbgetserverinforeq, State) ->
                                  server_version = get_riak_version()},
     send_msg(Resp, State);
 
-process_message(#rpbgetreq{bucket=B, key=K, r=R0}, 
+%% Anything else gets processed by a worker
+process_message(Msg, State) ->
+    spawn_link(fun() -> process_message_w(Msg, State) end),
+    State.
+
+-spec process_message_w(msg(), #state{}) ->  any().
+process_message_w(#rpbgetreq{bucket=B, key=K, r=R0}, 
                 #state{client=C} = State) ->
     R = normalize_rw_value(R0),
     case C:get(B, K, default_r(R)) of
@@ -176,7 +130,7 @@ process_message(#rpbgetreq{bucket=B, key=K, r=R0},
             send_error("~p", [Reason], State)
     end;
 
-process_message(#rpbputreq{bucket=B, key=K, vclock=PbVC, content=RpbContent,
+process_message_w(#rpbputreq{bucket=B, key=K, vclock=PbVC, content=RpbContent,
                            w=W0, dw=DW0, return_body=ReturnBody}, 
                 #state{client=C} = State) ->
 
@@ -201,7 +155,7 @@ process_message(#rpbputreq{bucket=B, key=K, vclock=PbVC, content=RpbContent,
             send_error("~p", [Reason], State)
     end;
 
-process_message(#rpbdelreq{bucket=B, key=K, rw=RW0}, 
+process_message_w(#rpbdelreq{bucket=B, key=K, rw=RW0}, 
                 #state{client=C} = State) ->
     RW = normalize_rw_value(RW0),
     case C:delete(B, K, default_rw(RW)) of
@@ -213,7 +167,7 @@ process_message(#rpbdelreq{bucket=B, key=K, rw=RW0},
             send_error("~p", [Reason], State)
     end;
 
-process_message(rpblistbucketsreq, 
+process_message_w(rpblistbucketsreq, 
                 #state{client=C} = State) ->
     case C:list_buckets() of
         {ok, Buckets} ->
@@ -223,30 +177,30 @@ process_message(rpblistbucketsreq,
     end;
 
 %% Start streaming in list keys 
-process_message(#rpblistkeysreq{bucket=B}=Req, 
+process_message_w(#rpblistkeysreq{bucket=B}, 
                 #state{client=C} = State) ->
     %% Pause incoming packets - stream_list_keys results
     %% will be processed by handle_info, it will 
     %% set socket active again on completion of streaming.
     {ok, ReqId} = C:stream_list_keys(B),
-    {pause, State#state{req = Req, req_ctx = ReqId}};
+    wait_for_keys(ReqId, State, ?DEFAULT_TIMEOUT);
 
 %% Get bucket properties
-process_message(#rpbgetbucketreq{bucket=B}, 
+process_message_w(#rpbgetbucketreq{bucket=B}, 
                 #state{client=C} = State) ->
     Props = C:get_bucket(B),
     PbProps = riakc_pb:pbify_rpbbucketprops(Props),
     send_msg(#rpbgetbucketresp{props = PbProps}, State);
 
 %% Set bucket properties
-process_message(#rpbsetbucketreq{bucket=B, props = PbProps}, 
+process_message_w(#rpbsetbucketreq{bucket=B, props = PbProps}, 
                 #state{client=C} = State) ->
     Props = riakc_pb:erlify_rpbbucketprops(PbProps),
     ok = C:set_bucket(B, Props),
     send_msg(rpbsetbucketresp, State);
 
 %% Start map/reduce job - results will be processed in handle_info
-process_message(#rpbmapredreq{request=MrReq, content_type=ContentType}=Req, 
+process_message_w(#rpbmapredreq{request=MrReq, content_type=ContentType}=Req, 
                 #state{client=C} = State) ->
 
     case decode_mapred_query(MrReq, ContentType) of
@@ -265,7 +219,7 @@ process_message(#rpbmapredreq{request=MrReq, content_type=ContentType}=Req,
                             %% Pause incoming packets - map/reduce results
                             %% will be processed by handle_info, it will 
                             %% set socket active again on completion of streaming.
-                            {pause, State#state{req = Req, req_ctx = ReqId}}
+                            wait_for_mapred(ReqId, State#state{req = Req}, ?DEFAULT_TIMEOUT)
                     end;
                is_binary(Inputs) ->
                     case C:mapred_bucket_stream(Inputs, Query, 
@@ -274,7 +228,7 @@ process_message(#rpbmapredreq{request=MrReq, content_type=ContentType}=Req,
                             send_error("~p", [Error], State);
 
                         {ok, ReqId} ->
-                            {pause, State#state{req = Req, req_ctx = ReqId}}
+                            wait_for_mapred(ReqId, State#state{req = Req}, ?DEFAULT_TIMEOUT)
                     end
             end
     end.
@@ -296,6 +250,46 @@ send_error(Msg, Fmt, ErrCode, State) ->
     %% protocol buffers accepts nested lists for binaries so no need to flatten the list
     ErrMsg = io_lib:format(Msg, Fmt),
     send_msg(#rpberrorresp{errmsg=ErrMsg, errcode=ErrCode}, State).
+
+%% Wait for keys to be streamed in and pass them to client
+-spec wait_for_keys(any(), #state{}, non_neg_integer()) -> any().
+wait_for_keys(ReqId, State, Timeout) ->
+    receive
+        {ReqId, {keys, []}} ->
+            %% No keys - no need to send a message, will send done soon.
+            wait_for_keys(ReqId, State, Timeout);
+        {ReqId, {keys, Keys}} ->
+            send_msg(#rpblistkeysresp{keys = Keys}, State),
+            wait_for_keys(ReqId, State, Timeout);
+        {ReqId, done} ->
+            send_msg(#rpblistkeysresp{done = 1}, State)
+    after Timeout ->
+        send_error("~p", [timeout], State)
+    end.
+
+%% Wait for mapred results and pass them to the client
+-spec wait_for_mapred(any(), #state{}, non_neg_integer()) -> any().
+wait_for_mapred(ReqId, State, Timeout) ->
+    receive
+        {flow_results, ReqId, done} ->
+            send_msg(#rpbmapredresp{done = 1}, State);
+        {flow_results, ReqId, {error, Reason}} ->
+            send_error("~p", [Reason], State);
+        {flow_results, PhaseId, ReqId, Res} ->
+            #state{req=#rpbmapredreq{content_type = ContentType}} = State,
+            case encode_mapred_phase(Res, ContentType) of
+                {error, Reason} ->
+                    send_error("~p", [Reason], State);
+                Response ->
+                    send_msg(#rpbmapredresp{phase=PhaseId, response=Response}, State),
+                    wait_for_mapred(ReqId, State, Timeout)
+            end;
+        {flow_error, ReqId, Error} ->
+            send_error("~p", [Error], State)
+    after Timeout ->
+        send_error("~p", [timeout], State)
+    end.
+
 
 %% Update riak_object with the pbcontent provided
 update_rpbcontent(O0, RpbContent) -> 
