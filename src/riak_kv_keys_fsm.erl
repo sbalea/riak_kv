@@ -40,7 +40,8 @@
                 bucket :: riak_object:bucket(),
                 timeout :: pos_integer(),
                 req_id :: pos_integer(),
-                ring :: riak_core_ring:riak_core_ring()
+                ring :: riak_core_ring:riak_core_ring(),
+                listers :: [{atom(), pid()}]
                }).
 
 start(ReqId,Bucket,Timeout,ClientType,ErrorTolerance,From) ->
@@ -49,30 +50,45 @@ start(ReqId,Bucket,Timeout,ClientType,ErrorTolerance,From) ->
 
 %% @private
 init([ReqId,Bucket,Timeout,ClientType,ErrorTolerance,Client]) ->
+    process_flag(trap_exit, true),
     {ok, Ring} = riak_core_ring_manager:get_my_ring(),
     {ok, Bloom} = ebloom:new(10000000,ErrorTolerance,ReqId),
     StateData = #state{client=Client, client_type=ClientType, timeout=Timeout,
                        bloom=Bloom, req_id=ReqId, bucket=Bucket, ring=Ring},
+    case ClientType of
+        %% Link to the mapred job so we die if the job dies
+        mapred ->
+            link(Client);
+        _ ->
+            ok
+    end,
     {ok,initialize,StateData,0}.
 
 %% @private
-initialize(timeout, StateData0=#state{bucket=Bucket, ring=Ring}) ->
+initialize(timeout, StateData0=#state{bucket=Bucket, ring=Ring, req_id=ReqId}) ->
     BucketProps = riak_core_bucket:get_bucket(Bucket, Ring),
     N = proplists:get_value(n_val,BucketProps),
     PLS0 = riak_core_ring:all_preflists(Ring,N),
-    {LA1, LA2} = lists:partition(fun({A,_B}) -> A rem N == 0 end,
-                              lists:zip(lists:seq(0,(length(PLS0)-1)), PLS0)),
-    {_, PLS} = lists:unzip(lists:append(LA1,LA2)),
+    {LA1, LA2} = lists:partition(fun({A,_B}) ->
+                                       A rem N == 0 orelse A rem (N + 1) == 0
+                               end,
+                               lists:zip(lists:seq(0,(length(PLS0)-1)), PLS0)),
+    {_, PLS} = lists:unzip(LA1 ++ LA2),
     Simul_PLS = trunc(length(PLS) / N),
-    StateData = StateData0#state{pls=PLS,simul_pls=Simul_PLS,
+    Listers = start_listers(ReqId, Bucket),
+    StateData = StateData0#state{pls=PLS,simul_pls=Simul_PLS, listers=Listers,
                                  wait_pls=[],vns=sets:from_list([])},
     reduce_pls(StateData).
 
-waiting_kl({kl, Keys, Idx, ReqId},
-           StateData0=#state{pls=PLS,vns=VNS0,wait_pls=WPL0,bloom=Bloom,
+waiting_kl({ReqId, {kl, _Idx, Keys}},
+           StateData=#state{bloom=Bloom,
                             req_id=ReqId,client=Client,timeout=Timeout,
                             bucket=Bucket,client_type=ClientType}) ->
     process_keys(Keys,Bucket,ClientType,Bloom,ReqId,Client),
+    {next_state, waiting_kl, StateData, Timeout};
+
+waiting_kl({ReqId, Idx, done}, StateData0=#state{wait_pls=WPL0,vns=VNS0,pls=PLS,
+                                                  req_id=ReqId,timeout=Timeout}) ->
     WPL = [{W_Idx,W_Node,W_PL} || {W_Idx,W_Node,W_PL} <- WPL0, W_Idx /= Idx],
     WNs = [W_Node || {W_Idx,W_Node,_W_PL} <- WPL0, W_Idx =:= Idx],
     Node = case WNs of
@@ -90,6 +106,7 @@ waiting_kl({kl, Keys, Idx, ReqId},
         _ -> reduce_pls(StateData)
     end;
 
+
 waiting_kl(timeout, StateData=#state{pls=PLS,wait_pls=WPL}) ->
     NewPLS = lists:append(PLS, [W_PL || {_W_Idx,_W_Node,W_PL} <- WPL]),
     reduce_pls(StateData#state{pls=NewPLS,wait_pls=[]}).
@@ -100,9 +117,9 @@ finish(StateData=#state{req_id=ReqId,client=Client,client_type=ClientType}) ->
         plain -> Client ! {ReqId, done}
     end,
     {stop,normal,StateData}.
-                                             
-reduce_pls(StateData0=#state{timeout=Timeout, req_id=ReqId,wait_pls=WPL,
-                             simul_pls=Simul_PLS, bucket=Bucket}) ->
+
+reduce_pls(StateData0=#state{timeout=Timeout, wait_pls=WPL,
+                             listers=Listers, simul_pls=Simul_PLS}) ->
     case find_free_pl(StateData0) of
         {none_free,NewPLS} ->
             StateData = StateData0#state{pls=NewPLS},
@@ -111,20 +128,33 @@ reduce_pls(StateData0=#state{timeout=Timeout, req_id=ReqId,wait_pls=WPL,
                 false -> {next_state, waiting_kl, StateData, Timeout}
             end;
         {[{Idx,Node}|RestPL],PLS} ->
-            case net_adm:ping(Node) of
-                pong ->
-                    riak_kv_vnode:list_keys({Idx,Node},Bucket,ReqId),
-                    WaitPLS = [{Idx,Node,RestPL}|WPL],
-                    StateData = StateData0#state{pls=PLS, wait_pls=WaitPLS},
-                    case length(WaitPLS) > Simul_PLS of
-                        true ->
-                            {next_state, waiting_kl, StateData, Timeout};
-                        false ->
-                            reduce_pls(StateData)
-                    end;
-                pang ->
-                    reduce_pls(StateData0#state{pls=[RestPL|PLS]})
-            end                        
+            case riak_core_node_watcher:services(Node) of
+                [] ->
+                    reduce_pls(StateData0#state{pls=[RestPL|PLS]});
+                _ ->
+                    %% Look up keylister for that node
+                    case proplists:get_value(Node, Listers) of
+                        undefined ->
+                            %% Node is down or hasn't been removed from preflists yet
+                            %% Log a warning, skip the node and continue sending
+                            %% out key list requests
+                            error_logger:warning_msg("Skipping keylist request for unknown node: ~p~n", [Node]),
+                            WaitPLS = [{Idx,Node,RestPL}|WPL],
+                            StateData = StateData0#state{pls=PLS, wait_pls=WaitPLS},
+                            reduce_pls(StateData);
+                        LPid ->
+                            %% Send the keylist request to the lister
+                            riak_kv_keylister:list_keys(LPid, {Idx, Node}),
+                            WaitPLS = [{Idx,Node,RestPL}|WPL],
+                            StateData = StateData0#state{pls=PLS, wait_pls=WaitPLS},
+                            case length(WaitPLS) > Simul_PLS of
+                                true ->
+                                    {next_state, waiting_kl, StateData, Timeout};
+                                false ->
+                                    reduce_pls(StateData)
+                            end
+                    end
+            end
     end.
 
 find_free_pl(StateData) -> find_free_pl1(StateData, []).
@@ -158,13 +188,18 @@ process_keys(Keys,Bucket,ClientType,Bloom,ReqId,Client) ->
 %% @private
 process_keys([],Bucket,ClientType,_Bloom,ReqId,Client,Acc) ->
     case ClientType of
-        mapred -> luke_flow:add_inputs(Client, [{Bucket,K} || K <- Acc]);
+        mapred ->
+            try
+                luke_flow:add_inputs(Client, [{Bucket,K} || K <- Acc])
+            catch _:_ ->
+                    exit(self(), normal)
+            end;
         plain -> Client ! {ReqId, {keys, Acc}}
     end,
     ok;
 process_keys([K|Rest],Bucket,ClientType,Bloom,ReqId,Client,Acc) ->
     case ebloom:contains(Bloom,K) of
-        true -> 
+        true ->
             process_keys(Rest,Bucket,ClientType,
                          Bloom,ReqId,Client,Acc);
         false ->
@@ -182,13 +217,27 @@ handle_sync_event(_Event, _From, _StateName, StateData) ->
     {stop,badmsg,StateData}.
 
 %% @private
+handle_info({'EXIT', Pid, normal}, _StateName, #state{client=Pid}=StateData) ->
+    {stop,normal,StateData};
 handle_info(_Info, _StateName, StateData) ->
     {stop,badmsg,StateData}.
 
 %% @private
-terminate(Reason, _StateName, _State) ->
+terminate(Reason, _StateName, #state{bloom=Bloom}) ->
+    ebloom:clear(Bloom),
     Reason.
 
 %% @private
 code_change(_OldVsn, StateName, State, _Extra) ->
     {ok, StateName, State}.
+
+%% @private
+start_listers(ReqId, Bucket) ->
+    Nodes = riak_core_node_watcher:nodes(riak_kv),
+    start_listers(Nodes, ReqId, Bucket, []).
+
+start_listers([], _ReqId, _Bucket, Accum) ->
+    Accum;
+start_listers([H|T], ReqId, Bucket, Accum) ->
+    {ok, Pid} = riak_kv_keylister_master:start_keylist(H, ReqId, Bucket),
+    start_listers(T, ReqId, Bucket, [{H, Pid}|Accum]).

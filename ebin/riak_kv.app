@@ -3,8 +3,9 @@
 {application, riak_kv,
  [
   {description, "Riak Key/Value Store"},
-  {vsn, "0.12.0"},
+  {vsn, "0.13.0rc3"},
   {modules, [
+             lk,
              raw_link_walker,
              riak,
              riak_client,
@@ -23,8 +24,12 @@
              riak_kv_js_manager,
              riak_kv_js_sup,
              riak_kv_js_vm,
+             riak_kv_keylister,
+             riak_kv_keylister_master,
+             riak_kv_keylister_sup,
              riak_kv_keys_fsm,
              riak_kv_legacy_vnode,
+             riak_kv_lru,
              riak_kv_map_executor,
              riak_kv_map_localphase,
              riak_kv_map_phase,

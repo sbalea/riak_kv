@@ -1,6 +1,6 @@
 %% -------------------------------------------------------------------
 %%
-%% riak_kv_wm_ping: simple Webmachine resource for availability test
+%% riak_kv_keylister_sup: Supervisor for starting keylister processes
 %%
 %% Copyright (c) 2007-2010 Basho Technologies, Inc.  All Rights Reserved.
 %%
@@ -19,22 +19,30 @@
 %% under the License.
 %%
 %% -------------------------------------------------------------------
+-module(riak_kv_keylister_sup).
 
-%% @doc simple Webmachine resource for availability test
+-behaviour(supervisor).
 
--module(riak_kv_wm_ping).
--author('Dave Smith <dizzyd@dizzyd.com>').
+%% API
+-export([start_link/0,
+         new_lister/3]).
 
-%% webmachine resource exports
--export([
-         init/1,
-         to_html/2
-        ]).
+%% Supervisor callbacks
+-export([init/1]).
 
--include_lib("webmachine/include/webmachine.hrl").
+new_lister(ReqId, Bucket, Caller) ->
+    start_child([ReqId, Bucket, Caller]).
+
+start_link() ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
-    {ok, undefined}.
+    SupFlags = {simple_one_for_one, 0, 1},
+    Process = {undefined,
+               {riak_kv_keylister, start_link, []},
+               temporary, brutal_kill, worker, dynamic},
+    {ok, {SupFlags, [Process]}}.
 
-to_html(ReqData, Ctx) ->
-    {"OK", ReqData, Ctx}.
+%% Internal functions
+start_child(Args) ->
+  supervisor:start_child(?MODULE, Args).

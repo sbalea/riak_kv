@@ -33,14 +33,16 @@
          list/1,
          list_bucket/2,
          fold/3,
+         fold_keys/3,
          drop/1,
          is_empty/1,
          callback/3]).
 
-
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 -endif.
+
+-include_lib("bitcask/include/bitcask.hrl").
 
 -define(MERGE_CHECK_INTERVAL, timer:minutes(3)).
 
@@ -115,15 +117,38 @@ list({Ref, _}) ->
             Other
     end.
 
-list_bucket(State, {filter, Bucket, Fun}) ->
-    [K || {B, K} <- ?MODULE:list(State),
-          B =:= Bucket,
-          Fun(K)];
-list_bucket(State, '_') ->
-    [B || {B, _K} <- ?MODULE:list(State)];
-list_bucket(State, Bucket) ->
-    [K || {B, K} <- ?MODULE:list(State), B =:= Bucket].
-
+list_bucket({Ref, _}, {filter, Bucket, Fun}) ->
+    bitcask:fold_keys(Ref,
+        fun(#bitcask_entry{key=BK},Acc) ->
+                {B,K} = binary_to_term(BK),
+                case B of
+                    Bucket ->
+                        case Fun(K) of
+                            true -> [K|Acc];
+                            false -> Acc
+                        end;
+                    _ ->
+                        Acc
+                end
+        end, []);
+list_bucket({Ref, _}, '_') ->
+    bitcask:fold_keys(Ref,
+        fun(#bitcask_entry{key=BK},Acc) ->
+                {B,_K} = binary_to_term(BK),
+                case lists:member(B,Acc) of
+                    true -> Acc;
+                    false -> [B|Acc]
+                end
+        end, []);
+list_bucket({Ref, _}, Bucket) ->
+    bitcask:fold_keys(Ref,
+        fun(#bitcask_entry{key=BK},Acc) ->
+                {B,K} = binary_to_term(BK),
+                case B of
+                    Bucket -> [K|Acc];
+                    _ -> Acc
+                end
+        end, []).
 
 fold({Ref, _}, Fun0, Acc0) ->
     %% When folding across the bitcask, the bucket/key tuple must
@@ -134,6 +159,11 @@ fold({Ref, _}, Fun0, Acc0) ->
                          Fun0(binary_to_term(K), V, Acc)
                  end,
                  Acc0).
+
+fold_keys({Ref, _}, Fun, Acc) ->
+    F = fun(#bitcask_entry{key=K}, Acc1) ->
+                Fun(binary_to_term(K), Acc1) end,
+    bitcask:fold_keys(Ref, F, Acc).
 
 drop({Ref, BitcaskRoot}) ->
     %% todo: once bitcask has a more friendly drop function
@@ -146,12 +176,12 @@ drop({Ref, BitcaskRoot}) ->
 
 is_empty({Ref, _}) ->
     %% Determining if a bitcask is empty requires us to find at least
-    %% one value that is NOT a tombstone. Accomplish this by doing a fold
-    %% that forcibly bails on the very first k/v encountered.
-    F = fun(_K, _V, _Acc0) ->
+    %% one value that is NOT a tombstone. Accomplish this by doing a fold_keys
+    %% that forcibly bails on the very first key encountered.
+    F = fun(_K, _Acc0) ->
                 throw(found_one_value)
         end,
-    case catch(bitcask:fold(Ref, F, undefined)) of
+    case catch(bitcask:fold_keys(Ref, F, undefined)) of
         found_one_value ->
             false;
         _ ->
@@ -199,7 +229,6 @@ schedule_sync(Ref, SyncIntervalMs) when is_reference(Ref) ->
 
 schedule_merge(Ref) when is_reference(Ref) ->
     riak_kv_backend:callback_after(?MERGE_CHECK_INTERVAL, Ref, merge_check).
-
 
 %% ===================================================================
 %% EUnit tests

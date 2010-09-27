@@ -1,3 +1,9 @@
+%% -------------------------------------------------------------------
+%%
+%% riak_kv_vnode: VNode Implementation
+%%
+%% Copyright (c) 2007-2010 Basho Technologies, Inc.  All Rights Reserved.
+%%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
 %% except in compliance with the License.  You may obtain
@@ -11,19 +17,18 @@
 %% KIND, either express or implied.  See the License for the
 %% specific language governing permissions and limitations
 %% under the License.
-
-%% Copyright (c) 2007-2010 Basho Technologies, Inc.  All Rights Reserved.
-
+%%
+%% -------------------------------------------------------------------
 -module(riak_kv_vnode).
 -behaviour(riak_core_vnode).
 %% API
--export([start_vnode/1, 
-         del/3, 
-         put/6, 
-         readrepair/6, 
-         list_keys/3,
-         map/5, 
-         fold/3, 
+-export([start_vnode/1,
+         del/3,
+         put/6,
+         readrepair/6,
+         list_keys/4,
+         map/5,
+         fold/3,
          get_vclocks/2,
          mapcache/4,
          purge_mapcaches/0]).
@@ -49,20 +54,25 @@
 -export([map_test/3]).
 -endif.
 
--record(state, {idx :: partition(), 
+-record(mrjob, {cachekey :: term(),
+                bkey :: term(),
+                reqid :: term(),
+                target :: pid()}).
+
+-record(state, {idx :: partition(),
                 mod :: module(),
                 modstate :: term(),
                 mapcache :: term(),
+                mrjobs :: term(),
                 in_handoff = false :: boolean()}).
 
 -record(putargs, {returnbody :: boolean(),
                   lww :: boolean(),
                   bkey :: {binary(), binary()},
                   robj :: term(),
-                  reqid :: non_neg_integer(), 
+                  reqid :: non_neg_integer(),
                   bprops :: maybe_improper_list(),
                   prunetime :: non_neg_integer()}).
--define(CLEAR_MAPCACHE_INTERVAL, 60000).
 
 %% TODO: add -specs to all public API funcs, this module seems fragile?
 
@@ -81,7 +91,7 @@ del(Preflist, BKey, ReqId) ->
 put(Preflist, BKey, Obj, ReqId, StartTime, Options) when is_integer(StartTime) ->
     put(Preflist, BKey, Obj, ReqId, StartTime, Options, {fsm, undefined, self()}).
 
-put(Preflist, BKey, Obj, ReqId, StartTime, Options, Sender) 
+put(Preflist, BKey, Obj, ReqId, StartTime, Options, Sender)
   when is_integer(StartTime) ->
     riak_core_vnode_master:command(Preflist,
                                    ?KV_PUT_REQ{
@@ -94,25 +104,26 @@ put(Preflist, BKey, Obj, ReqId, StartTime, Options, Sender)
                                    riak_kv_vnode_master).
 
 %% Do a put without sending any replies
-readrepair(Preflist, BKey, Obj, ReqId, StartTime, Options) ->   
+readrepair(Preflist, BKey, Obj, ReqId, StartTime, Options) ->
     put(Preflist, BKey, Obj, ReqId, StartTime, Options, ignore).
 
-list_keys(Preflist, Bucket, ReqId) ->
-    riak_core_vnode_master:command(Preflist,
-                                   ?KV_LISTKEYS_REQ{
-                                      bucket=Bucket,
-                                      req_id=ReqId},
-                                   {fsm, undefined, self()},
-                                   riak_kv_vnode_master).
+list_keys(Preflist, ReqId, Caller, Bucket) ->
+  riak_core_vnode_master:command(Preflist,
+                                 ?KV_LISTKEYS_REQ{
+                                    bucket=Bucket,
+                                    req_id=ReqId,
+                                    caller=Caller},
+                                 ignore,
+                                 riak_kv_vnode_master).
 
 map(Preflist, ClientPid, QTerm, BKey, KeyData) ->
-    riak_core_vnode_master:command(Preflist,
-                                   ?KV_MAP_REQ{
-                                      qterm=QTerm,
-                                      bkey=BKey,
-                                      keydata=KeyData},
-                                   {fsm, undefined, ClientPid},
-                                   riak_kv_vnode_master).
+    riak_core_vnode_master:sync_spawn_command(Preflist,
+                                              ?KV_MAP_REQ{
+                                                 qterm=QTerm,
+                                                 bkey=BKey,
+                                                 keydata=KeyData,
+                                                 from=ClientPid},
+                                              riak_kv_vnode_master).
 
 fold(Preflist, Fun, Acc0) ->
     riak_core_vnode_master:sync_spawn_command(Preflist,
@@ -124,23 +135,24 @@ fold(Preflist, Fun, Acc0) ->
 purge_mapcaches() ->
     VNodes = riak_core_vnode_master:all_nodes(?MODULE),
     lists:foreach(fun(VNode) -> riak_core_vnode:send_command(VNode, purge_mapcache) end, VNodes).
-    
+
 mapcache(Pid, BKey, What, R) ->
     riak_core_vnode:send_command(Pid, {mapcache, BKey, What, R}).
-   
-get_vclocks(Preflist, BKeyList) -> 
+
+get_vclocks(Preflist, BKeyList) ->
     riak_core_vnode_master:sync_spawn_command(Preflist,
                                               ?KV_VCLOCK_REQ{bkeys=BKeyList},
-                                              riak_kv_vnode_master).    
+                                              riak_kv_vnode_master).
 
 %% VNode callbacks
 
 init([Index]) ->
     Mod = app_helper:get_env(riak_kv, storage_backend),
+    CacheSize = app_helper:get_env(riak_kv, vnode_cache_entries, 100),
     Configuration = app_helper:get_env(riak_kv),
     {ok, ModState} = Mod:start(Index, Configuration),
-    schedule_clear_mapcache(),
-    {ok, #state{idx=Index, mod=Mod, modstate=ModState, mapcache=orddict:new()}}.
+
+    {ok, #state{idx=Index, mod=Mod, modstate=ModState, mapcache=riak_kv_lru:new(CacheSize), mrjobs=dict:new()}}.
 
 handle_command(?KV_PUT_REQ{bkey=BKey,
                            object=Object,
@@ -150,33 +162,39 @@ handle_command(?KV_PUT_REQ{bkey=BKey,
                Sender, State=#state{idx=Idx,mapcache=Cache}) ->
     riak_core_vnode:reply(Sender, {w, Idx, ReqId}),
     do_put(Sender, BKey,  Object, ReqId, StartTime, Options, State),
-    {noreply, State#state{mapcache=orddict:erase(BKey,Cache)}};
+    riak_kv_lru:clear_bkey(Cache, BKey),
+    {noreply, State};
 
 handle_command(?KV_GET_REQ{bkey=BKey,req_id=ReqId},Sender,State) ->
     do_get(Sender, BKey, ReqId, State);
-handle_command(?KV_LISTKEYS_REQ{bucket=Bucket, req_id=ReqId}, _Sender, 
-               State=#state{mod=Mod, modstate=ModState, idx=Idx}) ->
+handle_command(#riak_kv_listkeys_req_v1{bucket=Bucket, req_id=ReqId}, _Sender,
+                State=#state{mod=Mod, modstate=ModState, idx=Idx}) ->
     do_list_bucket(ReqId,Bucket,Mod,ModState,Idx,State);
-handle_command(?KV_DELETE_REQ{bkey=BKey, req_id=ReqId}, _Sender, 
-               State=#state{mod=Mod, modstate=ModState, 
+handle_command(?KV_LISTKEYS_REQ{bucket=Bucket, req_id=ReqId, caller=Caller}, _Sender,
+               State=#state{mod=Mod, modstate=ModState, idx=Idx}) ->
+    do_list_keys(Caller,ReqId,Bucket,Idx,Mod,ModState),
+    {noreply, State};
+
+handle_command(?KV_DELETE_REQ{bkey=BKey, req_id=ReqId}, _Sender,
+               State=#state{mod=Mod, modstate=ModState,
                             idx=Idx, mapcache=Cache}) ->
-    NewState = State#state{mapcache=orddict:erase(BKey,Cache)},
+    riak_kv_lru:clear_bkey(Cache, BKey),
     case Mod:delete(ModState, BKey) of
         ok ->
-            {reply, {del, Idx, ReqId}, NewState};
+            {reply, {del, Idx, ReqId}, State};
         {error, _Reason} ->
-            {reply, {fail, Idx, ReqId}, NewState}
+            {reply, {fail, Idx, ReqId}, State}
     end;
-handle_command(?KV_MAP_REQ{bkey=BKey,qterm=QTerm,keydata=KeyData},
-               Sender, State) ->
-    do_map(Sender,QTerm,BKey,KeyData,State,self());
+handle_command(?KV_MAP_REQ{bkey=BKey,qterm=QTerm,keydata=KeyData,from=From},
+               _Sender, State) ->
+    do_map(From,QTerm,BKey,KeyData,State,self());
 handle_command(?KV_VCLOCK_REQ{bkeys=BKeys}, _Sender, State) ->
     {reply, do_get_vclocks(BKeys, State), State};
 handle_command(?FOLD_REQ{foldfun=Fun, acc0=Acc},_Sender,State) ->
     Reply = do_fold(Fun, Acc, State),
     {reply, Reply, State};
 %% Commands originating from inside this vnode
-handle_command({backend_callback, Ref, Msg}, _Sender, 
+handle_command({backend_callback, Ref, Msg}, _Sender,
                State=#state{mod=Mod, modstate=ModState}) ->
     Mod:callback(ModState, Ref, Msg),
     {noreply, State};
@@ -188,21 +206,42 @@ handle_command({mapcache, BKey,{FunName,Arg,KeyData}, MF_Res}, _Sender,
     end,
     KeyCache = orddict:store({FunName,Arg,KeyData},MF_Res,KeyCache0),
     {noreply, State#state{mapcache=orddict:store(BKey,KeyCache,Cache)}};
-handle_command({mapcache, BKey,{M,F,Arg,KeyData},MF_Res}, _Sender, 
+handle_command({mapcache, BKey,{M,F,Arg,KeyData},MF_Res}, _Sender,
                State=#state{mapcache=Cache}) ->
-    KeyCache0 = case orddict:find(BKey, Cache) of
-        error -> orddict:new();
-        {ok,CDict} -> CDict
-    end,
-    KeyCache = orddict:store({M,F,Arg,KeyData},MF_Res,KeyCache0),
-    {noreply, State#state{mapcache=orddict:store(BKey,KeyCache,Cache)}};
-handle_command(purge_mapcache, _Sender, State) ->
-    {noreply, State#state{mapcache=orddict:new()}};
-handle_command(clear_mapcache, _Sender, State) ->
-    schedule_clear_mapcache(),
-    {noreply, State#state{mapcache=orddict:new()}}.
+    riak_kv_lru:put(Cache, BKey, {M,F,Arg,KeyData}, MF_Res),
+    {noreply, State};
+handle_command(purge_mapcache, _Sender, #state{mapcache=Cache}=State) ->
+    riak_kv_lru:clear(Cache),
+    {noreply, State};
+handle_command(clear_mapcache, _Sender, #state{mapcache=Cache}=State) ->
+    riak_kv_lru:clear(Cache),
+    {noreply, State};
+handle_command({mapexec_error_noretry, JobId, Err}, _Sender, #state{mrjobs=Jobs}=State) ->
+    NewState = case dict:find(JobId, Jobs) of
+                   {ok, Job} ->
+                       Jobs1 = dict:erase(JobId, Jobs),
+                       #mrjob{target=Target} = Job,
+                       gen_fsm:send_event(Target, {mapexec_error_noretry, self(), Err}),
+                       State#state{mrjobs=Jobs1};
+                   error ->
+                       State
+               end,
+    {noreply, NewState};
+handle_command({mapexec_reply, JobId, Result}, _Sender, #state{mrjobs=Jobs,
+                                                               mapcache=MapCache}=State) ->
+    NewState = case dict:find(JobId, Jobs) of
+                   {ok, Job} ->
+                       Jobs1 = dict:erase(JobId, Jobs),
+                       #mrjob{cachekey=CacheKey, target=Target, bkey=BKey} = Job,
+                       riak_kv_lru:put(MapCache, BKey, CacheKey, Result),
+                       gen_fsm:send_event(Target, {mapexec_reply, Result, self()}),
+                       State#state{mrjobs=Jobs1};
+                   error ->
+                       State
+               end,
+    {noreply, NewState}.
 
-handle_handoff_command(Req=?FOLD_REQ{}, Sender, State) -> 
+handle_handoff_command(Req=?FOLD_REQ{}, Sender, State) ->
     handle_command(Req, Sender, State);
 handle_handoff_command(Req={backend_callback, _Ref, _Msg}, Sender, State) ->
     handle_command(Req, Sender, State);
@@ -269,7 +308,7 @@ do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, PruneTime, Options, State) ->
     riak_core_vnode:reply(Sender, Reply),
     riak_kv_stat:update(vnode_put).
 
-prepare_put(#state{}, #putargs{lww=true, robj=RObj}) -> 
+prepare_put(#state{}, #putargs{lww=true, robj=RObj}) ->
     {true, RObj};
 prepare_put(#state{mod=Mod,modstate=ModState}, #putargs{bkey=BKey,
                                                         robj=RObj,
@@ -366,6 +405,58 @@ do_list_bucket(ReqID,Bucket,Mod,ModState,Idx,State) ->
     RetVal = Mod:list_bucket(ModState,Bucket),
     {reply, {kl, RetVal, Idx, ReqID}, State}.
 
+%% Use in-memory key list for bitcask backend
+%% @private
+do_list_keys(Caller,ReqId,Bucket,Idx,Mod,ModState)
+  when Mod =:= riak_kv_bitcask_backend ->
+    F = fun(BKey, Acc) ->
+                process_keys(Caller, ReqId, Idx, Bucket, BKey, Acc) end,
+    case Mod:fold_keys(ModState, F, []) of
+        [] ->
+            ok;
+        Remainder ->
+            Caller ! {ReqId, {kl, Idx, Remainder}}
+    end,
+    Caller ! {ReqId, Idx, done};
+%% @private
+do_list_keys(Caller,ReqId,Bucket,Idx,Mod,ModState) ->
+    F = fun(BKey, _, Acc) ->
+                process_keys(Caller, ReqId, Idx, Bucket, BKey, Acc) end,
+    case Mod:fold(ModState, F, []) of
+        [] ->
+            ok;
+        Remainder ->
+            Caller ! {ReqId, {kl, Idx, Remainder}}
+    end,
+    Caller ! {ReqId, Idx, done}.
+
+%% @private
+process_keys(Caller, ReqId, Idx, '_', {Bucket, _K}, Acc) ->
+    %% Bucket='_' means "list buckets" instead of "list keys"
+    buffer_key_result(Caller, ReqId, Idx, [Bucket|Acc]);
+process_keys(Caller, ReqId, Idx, {filter, Bucket, Fun}, {Bucket, K}, Acc) ->
+    %% Bucket={filter,Bucket,Fun} means "only include keys
+    %% in Bucket that make Fun(K) return 'true'"
+    case Fun(K) of
+        true ->
+            buffer_key_result(Caller, ReqId, Idx, [K|Acc]);
+        false ->
+            Acc
+    end;
+process_keys(Caller, ReqId, Idx, Bucket, {Bucket, K}, Acc) ->
+    buffer_key_result(Caller, ReqId, Idx, [K|Acc]);
+process_keys(_Caller, _ReqId, _Idx, _Bucket, {_B, _K}, Acc) ->
+    Acc.
+
+buffer_key_result(Caller, ReqId, Idx, Acc) ->
+    case length(Acc) >= 100 of
+        true ->
+            Caller ! {ReqId, {kl, Idx, Acc}},
+            [];
+        false ->
+            Acc
+    end.
+
 %% @private
 do_fold(Fun, Acc0, _State=#state{mod=Mod, modstate=ModState}) ->
     Mod:fold(ModState, Fun, Acc0).
@@ -399,10 +490,14 @@ do_diffobj_put(BKey={Bucket,_}, DiffObj,
     end.
 
 %% @private
-do_map(Sender, QTerm, BKey, KeyData, #state{mod=Mod, modstate=ModState, mapcache=Cache}=State, VNode) ->
-    {Reply, NewState} = case do_map(QTerm, BKey, Mod, ModState, KeyData, Cache, VNode, Sender) of
-                            map_executing ->
-                                {{mapexec_reply, executing, self()}, State};
+do_map(Sender, QTerm, BKey, KeyData, #state{mrjobs=Jobs, mod=Mod, modstate=ModState,
+                                            mapcache=Cache}=State, VNode) ->
+    {Reply, NewState} = case do_map(QTerm, BKey, Mod, ModState, KeyData, Cache, VNode) of
+                            {map_executing, BKey, CacheKey, ReqId} ->
+                                J = #mrjob{reqid=ReqId, target=Sender,
+                                           bkey=BKey, cachekey=CacheKey},
+                                Jobs1 = dict:store(ReqId, J, Jobs),
+                                {{mapexec_reply, executing, self()}, State#state{mrjobs=Jobs1}};
                             {ok, Retval} ->
                                 {{mapexec_reply, Retval, self()}, State};
                             {error, Error} ->
@@ -410,25 +505,27 @@ do_map(Sender, QTerm, BKey, KeyData, #state{mod=Mod, modstate=ModState, mapcache
                         end,
     {reply, Reply, NewState}.
 
-do_map({erlang, {map, FunTerm, Arg, _Acc}}, BKey, Mod, ModState, KeyData, Cache, VNode, _Sender) ->
+do_map({erlang, {map, FunTerm, Arg, _Acc}}, BKey, Mod, ModState, KeyData, Cache, _VNode) ->
     CacheKey = build_key(FunTerm, Arg, KeyData),
-    CacheVal = cache_fetch(BKey, CacheKey, Cache),
-    case CacheVal of
-        not_cached ->
-            uncached_map(BKey, Mod, ModState, FunTerm, Arg, KeyData, VNode);
+    case riak_kv_lru:fetch(Cache, BKey, CacheKey) of
+        notfound ->
+            uncached_map(BKey, Mod, ModState, FunTerm, Arg, KeyData);
         CV ->
             {ok, CV}
     end;
-do_map({javascript, {map, FunTerm, Arg, _}=QTerm}, BKey, Mod, ModState, KeyData, Cache, _VNode, Sender) ->
+do_map({javascript, {map, FunTerm, Arg, _}=QTerm}, BKey, Mod, ModState, KeyData, Cache, _VNode) ->
     CacheKey = build_key(FunTerm, Arg, KeyData),
-    CacheVal = cache_fetch(BKey, CacheKey, Cache),
-    case CacheVal of
-        not_cached ->
+    case riak_kv_lru:fetch(Cache, BKey, CacheKey) of
+        notfound ->
             case Mod:get(ModState, BKey) of
                 {ok, Binary} ->
                     V = binary_to_term(Binary),
-                    riak_kv_js_manager:dispatch({Sender, QTerm, V, KeyData, BKey}),
-                    map_executing;
+                    case riak_kv_js_manager:dispatch({self(), QTerm, V, KeyData, BKey}, 10) of
+                        {ok, JobId} ->
+                            {map_executing, BKey, CacheKey, JobId};
+                        Error ->
+                            Error
+                    end;
                 {error, notfound} ->
                     {error, notfound}
             end;
@@ -440,33 +537,23 @@ build_key({modfun, CMod, CFun}, Arg, KeyData) ->
     {CMod, CFun, Arg, KeyData};
 build_key({jsfun, FunName}, Arg, KeyData) ->
     {FunName, Arg, KeyData};
+build_key({jsanon, Src}, Arg, KeyData) ->
+    {mochihex:to_hex(crypto:sha(Src)), Arg, KeyData};
 build_key(_, _, _) ->
     no_key.
 
-cache_fetch(_BKey, no_key, _Cache) ->
-    not_cached;
-cache_fetch(BKey, CacheKey, Cache) ->
-    case orddict:find(BKey, Cache) of
-        error -> not_cached;
-        {ok,CDict} ->
-            case orddict:find(CacheKey,CDict) of
-                error -> not_cached;
-                {ok,CVal} -> CVal
-            end
-    end.
-
-uncached_map(BKey, Mod, ModState, FunTerm, Arg, KeyData, VNode) ->
+uncached_map(BKey, Mod, ModState, FunTerm, Arg, KeyData) ->
     case Mod:get(ModState, BKey) of
         {ok, Binary} ->
             V = binary_to_term(Binary),
-            exec_map(V, FunTerm, Arg, BKey, KeyData, VNode);
+            exec_map(V, FunTerm, Arg, BKey, KeyData);
         {error, notfound} ->
-            exec_map({error, notfound}, FunTerm, Arg, BKey, KeyData, VNode);
+            exec_map({error, notfound}, FunTerm, Arg, BKey, KeyData);
         X ->
             {error, X}
     end.
 
-exec_map(V, FunTerm, Arg, BKey, KeyData, _VNode) ->
+exec_map(V, FunTerm, Arg, BKey, KeyData) ->
     try
         case FunTerm of
             {qfun, F} -> {ok, (F)(V,KeyData,Arg)};
@@ -480,10 +567,6 @@ exec_map(V, FunTerm, Arg, BKey, KeyData, _VNode) ->
             {error, Reason}
     end.
 
-schedule_clear_mapcache() ->
-    riak_core_vnode:send_command_after(?CLEAR_MAPCACHE_INTERVAL, clear_mapcache).
-
-
 -ifdef(TEST).
 
 dummy_backend() ->
@@ -491,7 +574,91 @@ dummy_backend() ->
     riak_core_ring_manager:set_ring_global(Ring),
     application:set_env(riak_kv, storage_backend, riak_kv_ets_backend),
     application:set_env(riak_core, default_bucket_props, []).
-   
+
+backend_with_known_key() ->
+    dummy_backend(),
+    {ok, S1} = init([0]),
+    B = <<"f">>,
+    K = <<"b">>,
+    O = riak_object:new(B, K, <<"z">>),
+    {noreply, S2} = handle_command(?KV_PUT_REQ{bkey={B,K},
+                                               object=O,
+                                               req_id=123,
+                                               start_time=riak_core_util:moment(),
+                                               options=[]},
+                                   {raw, 456, self()},
+                                   S1),
+    {S2, B, K}.
+
+list_buckets_test() ->
+    {S, B, _K} = backend_with_known_key(),
+    Caller = new_result_listener(),
+    handle_command(?KV_LISTKEYS_REQ{bucket='_',
+                                    req_id=124,
+                                    caller=Caller},
+                   {raw, 456, self()}, S),
+    ?assertEqual({ok, [B]}, results_from_listener(Caller)),
+    flush_msgs().
+
+filter_keys_test() ->
+    {S, B, K} = backend_with_known_key(),
+
+    Caller1 = new_result_listener(),
+    handle_command(?KV_LISTKEYS_REQ{
+                      bucket={filter,B,fun(_) -> true end},
+                      req_id=124,
+                      caller=Caller1},
+                   {raw, 456, self()}, S),
+    ?assertEqual({ok, [K]}, results_from_listener(Caller1)),
+
+    Caller2 = new_result_listener(),
+    handle_command(?KV_LISTKEYS_REQ{
+                      bucket={filter,B,fun(_) -> false end},
+                      req_id=125,
+                      caller=Caller2},
+                   {raw, 456, self()}, S),
+    ?assertEqual({ok, []}, results_from_listener(Caller2)),
+
+    Caller3 = new_result_listener(),
+    handle_command(?KV_LISTKEYS_REQ{
+                      bucket={filter,<<"g">>,fun(_) -> true end},
+                      req_id=126,
+                      caller=Caller3},
+                   {raw, 456, self()}, S),
+    ?assertEqual({ok, []}, results_from_listener(Caller3)),
+
+    flush_msgs().
+
+new_result_listener() ->
+    spawn(fun result_listener/0).
+
+result_listener() ->
+    result_listener_keys([]).
+
+result_listener_keys(Acc) ->
+    receive
+        {_,{kl,_,Keys}} ->
+            result_listener_keys(Keys++Acc);
+        {_, _, done} ->
+            result_listener_done(Acc)
+    after 5000 ->
+            result_listener_done({timeout, Acc})
+    end.
+
+result_listener_done(Result) ->
+    receive
+        {get_results, Pid} ->
+            Pid ! {listener_results, Result}
+    end.
+
+results_from_listener(Listener) ->
+    Listener ! {get_results, self()},
+    receive
+        {listener_results, Result} ->
+            {ok, Result}
+    after 5000 ->
+            {error, listener_timeout}
+    end.
 
 %% Make sure the mapcache gets cleared when the bkey is updated
 mapcache_put_test() ->
@@ -499,10 +666,10 @@ mapcache_put_test() ->
     BKey = {<<"b">>,<<"k">>},
     CacheKey = {mod,func,arg,keydata},
     {ok, S1} = init([0]),
-    ?assertEqual(not_cached, cache_fetch(BKey, CacheKey, S1#state.mapcache)),
+    ?assertEqual(notfound, riak_kv_lru:fetch(S1#state.mapcache, BKey, CacheKey)),
     {noreply, S2} = handle_command({mapcache, BKey, CacheKey, result},
                                    noreply, S1),
-    ?assertEqual(result, cache_fetch(BKey, CacheKey, S2#state.mapcache)),
+    ?assertEqual(result, riak_kv_lru:fetch(S2#state.mapcache, BKey, CacheKey)),
 
     O = riak_object:new(<<"b">>,<<"k">>,<<"v">>),
     {noreply, S3} = handle_command(?KV_PUT_REQ{bkey=BKey,
@@ -511,7 +678,7 @@ mapcache_put_test() ->
                                                start_time=riak_core_util:moment(),
                                                options=[]},
                                    {raw, 456, self()}, S2),
-    ?assertEqual(not_cached, cache_fetch(BKey, CacheKey, S3#state.mapcache)),
+    ?assertEqual(notfound, riak_kv_lru:fetch(S3#state.mapcache, BKey, CacheKey)),
     %% The put request generates a {w,...} and {dw,...} event
     flush_msgs().
 
@@ -521,15 +688,15 @@ mapcache_delete_test() ->
     BKey = {<<"b">>,<<"k">>},
     CacheKey = {mod,func,arg,keydata},
     {ok, S1} = init([0]),
-    ?assertEqual(not_cached, cache_fetch(BKey, CacheKey, S1#state.mapcache)),
+    ?assertEqual(notfound, riak_kv_lru:fetch(S1#state.mapcache, BKey, CacheKey)),
     {noreply, S2} = handle_command({mapcache, BKey, CacheKey, result},
                                    noreply, S1),
-    ?assertEqual(result, cache_fetch(BKey, CacheKey, S2#state.mapcache)),
+    ?assertEqual(result, riak_kv_lru:fetch(S2#state.mapcache, BKey, CacheKey)),
 
     {reply, {del, 0, 123}, S3} = handle_command(?KV_DELETE_REQ{bkey=BKey,
                                                   req_id=123},
                                    {raw, 456, self()}, S2),
-    ?assertEqual(not_cached, cache_fetch(BKey, CacheKey, S3#state.mapcache)),
+    ?assertEqual(notfound, riak_kv_lru:fetch(S3#state.mapcache, BKey, CacheKey)),
     %% The put request generates a {w,...} and {dw,...} event
     flush_msgs().
 
@@ -559,7 +726,7 @@ purge_mapcaches_test() ->
 
     %% Prove nothing there
     FunTerm = {modfun, ?MODULE, map_test},
-    Arg = arg, 
+    Arg = arg,
     QTerm = {erlang, {map, FunTerm, Arg, acc}},
     KeyData = keydata,
     CacheKey = build_key(FunTerm, Arg, KeyData),
@@ -581,31 +748,28 @@ purge_mapcaches_test() ->
 
     riak_core_node_watcher:service_down(riak_kv),
     cleanup_servers().
-     
+
 cleanup_servers() ->
     riak_kv_test_util:stop_process(riak_core_node_watcher),
     riak_kv_test_util:stop_process(riak_core_node_watcher_events),
     riak_kv_test_util:stop_process(riak_core_ring_events),
     riak_kv_test_util:stop_process(riak_core_vnode_sup),
     riak_kv_test_util:stop_process(riak_kv_vnode_master).
-    
+
 
 check_mapcache(Index, QTerm, BKey, KeyData, Expect) ->
-    map({Index,node()}, self(), QTerm, BKey, KeyData),
-    receive
-        Msg ->
-            {'$gen_event',{mapexec_reply,Result,_Pid}} = Msg,
-            ?assertEqual(Expect, Result)
-    after
-        100 ->
+    case map({Index,node()}, self(), QTerm, BKey, KeyData) of
+        {mapexec_reply, Result, _Pid} ->
+            ?assertMatch(Expect, Result);
+        _ ->
             ?assert(false)
     end.
-         
-%% Map identity function - returns what you give it   
+
+%% Map identity function - returns what you give it
 map_test(Obj, _KeyData, _Arg) ->
     Obj.
 
-flush_msgs() ->                              
+flush_msgs() ->
     receive
         _Msg ->
             flush_msgs()
@@ -613,7 +777,7 @@ flush_msgs() ->
         0 ->
             ok
     end.
-    
-    
+
+
 
 -endif. % TEST

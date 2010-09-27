@@ -45,12 +45,10 @@ init([]) ->
                {riak_core_vnode_master, start_link,
                 [riak_kv_vnode, riak_kv_legacy_vnode]},
                permanent, 5000, worker, [riak_core_vnode_master]},
-    RiakPb = [{riak_kv_pb_listener,
-               {riak_kv_pb_listener, start_link, []},
-               permanent, 5000, worker, [riak_kv_pb_listener]},
-              {riak_kv_pb_socket_sup,
-               {riak_kv_pb_socket_sup, start_link, []},
-               permanent, infinity, supervisor, [riak_kv_pb_socket_sup]}
+    RiakPb = [ {riak_kv_pb_socket_sup, {riak_kv_pb_socket_sup, start_link, []},
+                permanent, infinity, supervisor, [riak_kv_pb_socket_sup]},
+               {riak_kv_pb_listener, {riak_kv_pb_listener, start_link, []},
+               permanent, 5000, worker, [riak_kv_pb_listener]}
               ],
     RiakStat = {riak_kv_stat,
                 {riak_kv_stat, start_link, []},
@@ -62,6 +60,14 @@ init([]) ->
     RiakJsSup = {riak_kv_js_sup,
                  {riak_kv_js_sup, start_link, []},
                  permanent, infinity, supervisor, [riak_kv_js_sup]},
+    KLMaster = {riak_kv_keylister_master,
+                 {riak_kv_keylister_master, start_link, []},
+                 permanent, 30000, worker, [riak_kv_keylister_master]},
+    KLSup = {riak_kv_keylister_sup,
+             {riak_kv_keylister_sup, start_link, []},
+             permanent, infinity, supervisor, [riak_kv_keylister_sup]},
+
+
     % Figure out which processes we should run...
     IsPbConfigured = (app_helper:get_env(riak_kv, pb_ip) /= undefined)
         andalso (app_helper:get_env(riak_kv, pb_port) /= undefined),
@@ -73,6 +79,8 @@ init([]) ->
         ?IF(HasStorageBackend, VMaster, []),
         ?IF(IsPbConfigured, RiakPb, []),
         ?IF(IsStatEnabled, RiakStat, []),
+        KLSup,
+        KLMaster,
         RiakJsSup,
         RiakJsMgr
     ]),
